@@ -1,0 +1,114 @@
+---
+- name: Prepare All Nodes
+  hosts: all
+  become: true
+
+  tasks:
+  - name: Edit 127.0.0.1 with IP suffixing with .local
+    lineinfile:
+      path: /etc/hosts
+      regexp: "^.*{{ ansible_hostname }}.*"
+      line: "{{ ansible_enp0s8.ipv4.address }} {{ ansible_hostname }} {{ ansible_hostname }}.local"
+      state: present
+  - name: Update /etc/hosts about other hosts
+    lineinfile:
+      path: /etc/hosts
+      line: "{{ item.ip }} {{ item.host }}"
+      state: present
+      create: yes
+    loop: "{{ all_vars }}"
+    when: item.host != ansible_hostname
+  - name: Update DNS
+    lineinfile:
+      path: /etc/systemd/resolved.conf
+      regexp: '^#DNS=.*$'
+      line: "DNS=8.8.8.8"
+      create: yes
+  - name: Restart systemd-resolved
+    service:
+      name: systemd-resolved
+      state: restarted
+
+- name: Prepare Loadbalancer Node
+  hosts: loadbalancer
+  become: true
+
+  tasks:
+  - name: Add config to use not checking host key
+    lineinfile:
+      path: /etc/ansible/ansible.cfg
+      regexp: '^#\s*host_key_checking.*$'
+      line: "host_key_checking = False"
+      state: present
+
+  - name: Add config to use auto python interpreter
+    lineinfile:
+      path: /etc/ansible/ansible.cfg
+      line: "interpreter_python = auto"
+      insertbefore: '\[inventory\]'
+      state: present
+
+  - name: Copy temporary inventory file to default location
+    copy:
+      src: "{{ inventory_file }}"
+      dest: /etc/ansible/hosts
+      owner: root
+      group: root
+      mode: 0644
+      force: yes
+  - name: Generate rsa key
+    openssh_keypair:
+      type: rsa
+      path: /home/vagrant/.ssh/id_rsa
+    become: no
+  - name: Copy ssh id to node01
+    shell: "sshpass -p vagrant ssh-copy-id -f -i /home/vagrant/.ssh/id_rsa.pub -o StrictHostKeyChecking=no vagrant@{{ item.host }}"
+    become: no
+    failed_when: result.rc != 0
+    register: result
+    check_mode: no
+    loop: "{{ all_vars }}"
+    when: item.host != "loadbalancer"
+
+- name: Prepare Worker Nodes
+  hosts: worker
+  become: true
+
+  tasks:
+  - name: Add the br_netfilter module
+    modprobe:
+      name: br_netfilter
+      state: present
+  - name: Allow bridge nf traffic
+    sysctl:
+      name: net.bridge.bridge-nf-call-iptables
+      value: '1'
+      sysctl_set: yes
+      state: present
+      reload: yes
+  - name: Get software for apt repository management.
+    apt:
+      state: present
+      name:
+        - apt-transport-https
+        - ca-certificates
+        - curl
+        - gnupg-agent
+        - software-properties-common
+  - name: Add Docker official GPG key
+    apt_key:
+      id: 9DC858229FC7DD38854AE2D88D81803C0EBFCD88
+      url: https://download.docker.com/linux/ubuntu/gpg
+      state: present
+  - name: Add repository
+    apt_repository:
+      repo: "deb [arch=amd64] https://download.docker.com/linux/ubuntu {{ ansible_distribution_release }} stable"
+      state: present
+  - name: Install docker
+    apt:
+      update_cache: yes
+      state: present
+      name:
+        - "{{ 'docker-ce=5:19.03.5~3-0~ubuntu-' + ansible_distribution_release }}"
+        - "{{ 'docker-ce-cli=5:19.03.5~3-0~ubuntu-' + ansible_distribution_release }}"
+        - containerd.io
